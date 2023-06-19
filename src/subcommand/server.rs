@@ -125,11 +125,9 @@ pub(crate) struct Server {
 
 impl Server {
   pub(crate) fn run(self, options: Options, index: Arc<Index>, handle: Handle) -> Result {
-
     Runtime::new()?.block_on(async {
-      
       // TODO Comment this section to index block by block instead of all at once
-      // This section keeps indexed updated 
+      // This section keeps indexed updated
       // let clone = index.clone();
       // thread::spawn(move || loop {
       //   if let Err(error) = clone.update() {
@@ -174,6 +172,11 @@ impl Server {
         .route("/status", get(Self::status))
         .route("/tx/:txid", get(Self::transaction))
         .route("/api/tx/:txid", get(Self::transaction_json))
+        .route(
+          "/api/inscription/:inscription_id",
+          get(Self::inscription_json),
+        )
+        .route("/api/output/:output", get(Self::output_json))
         .layer(Extension(index))
         .layer(Extension(page_config))
         .layer(Extension(Arc::new(config)))
@@ -396,6 +399,84 @@ impl Server {
     Redirect::to(&format!("/sat/{sat}"))
   }
 
+  async fn output_json(
+    Extension(page_config): Extension<Arc<PageConfig>>,
+    Extension(index): Extension<Arc<Index>>,
+    Path(outpoint): Path<OutPoint>,
+  ) -> ServerResult<Response> {
+    let list = if index.has_sat_index()? {
+      index.list(outpoint)?
+    } else {
+      None
+    };
+
+    let output = if outpoint == OutPoint::null() || outpoint == unbound_outpoint() {
+      let mut value = 0;
+
+      if let Some(List::Unspent(ranges)) = &list {
+        for (start, end) in ranges {
+          value += end - start;
+        }
+      }
+
+      TxOut {
+        value,
+        script_pubkey: Script::new(),
+      }
+    } else {
+      index
+        .get_transaction(outpoint.txid)?
+        .ok_or_not_found(|| format!("output {outpoint}"))?
+        .output
+        .into_iter()
+        .nth(outpoint.vout as usize)
+        .ok_or_not_found(|| format!("output {outpoint}"))?
+    };
+    let inscriptions = index.get_inscriptions_on_output(outpoint)?;
+
+    let data = serde_json::json!({
+        "chain": page_config.chain,
+        "inscriptions": inscriptions.iter().map(|inscription| inscription.to_string()).collect::<Vec<_>>(),
+        "value": output.value,
+        "script_pubkey": output.script_pubkey.asm(),
+        "address": match  page_config.chain.address_from_script(&output.script_pubkey ){
+          Ok(address) => address.to_string(),
+          Err(_) => "".to_string(),
+        },
+        "transaction":outpoint.txid,
+        "range": match list{
+          Some(List::Unspent(ranges)) => {
+            let mut json_array: Vec<serde_json::Value> = Vec::new();
+            for( start, end) in ranges{
+              json_array.push(serde_json::json!({
+                "start": start,
+                "end": end,
+              }));
+            }
+            serde_json::json!(json_array)
+          },
+          Some(List::Spent) => serde_json::json!({}),
+          None =>  serde_json::json!({}),
+        }
+    });
+
+    // Serialize the JSON into a string
+    let json = serde_json::to_string(&data).unwrap();
+    Ok(
+      (
+        [
+          (header::CONTENT_TYPE, "application/json"),
+          (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'unsafe-inline'",
+          ),
+        ],
+        json,
+      )
+        .into_response(),
+    )
+  }
+
   async fn output(
     Extension(page_config): Extension<Arc<PageConfig>>,
     Extension(index): Extension<Arc<Index>>,
@@ -532,7 +613,7 @@ impl Server {
     let inscription_id: Option<InscriptionId> = inscription.map(|_| txid.into());
 
     let insc_id = match inscription_id {
-      Some(inscription_id) =>inscription_id.to_string(),
+      Some(inscription_id) => inscription_id.to_string(),
       None => "".to_string(),
     };
 
@@ -541,6 +622,8 @@ impl Server {
         "block": b,
         "inscriptionId": insc_id,
         "content_url": format!("/content/{}", insc_id),
+        "link":format!("/inscription/{}", insc_id),
+
     });
 
     // Serialize the JSON into a string
@@ -861,6 +944,89 @@ impl Server {
       Media::Unknown => Ok(PreviewUnknownHtml.into_response()),
       Media::Video => Ok(PreviewVideoHtml { inscription_id }.into_response()),
     }
+  }
+
+  async fn inscription_json(
+    Extension(page_config): Extension<Arc<PageConfig>>,
+    Extension(index): Extension<Arc<Index>>,
+    Path(inscription_id): Path<InscriptionId>,
+  ) -> ServerResult<Response> {
+    let entry = index
+      .get_inscription_entry(inscription_id)?
+      .ok_or_not_found(|| format!("inscription {inscription_id}"))?;
+
+    let inscription = index
+      .get_inscription_by_id(inscription_id)?
+      .ok_or_not_found(|| format!("inscription {inscription_id}"))?;
+
+    let satpoint = index
+      .get_inscription_satpoint_by_id(inscription_id)?
+      .ok_or_not_found(|| format!("inscription {inscription_id}"))?;
+
+    let output = if satpoint.outpoint == unbound_outpoint() {
+      None
+    } else {
+      Some(
+        index
+          .get_transaction(satpoint.outpoint.txid)?
+          .ok_or_not_found(|| format!("inscription {inscription_id} current transaction"))?
+          .output
+          .into_iter()
+          .nth(satpoint.outpoint.vout.try_into().unwrap())
+          .ok_or_not_found(|| format!("inscription {inscription_id} current transaction output"))?,
+      )
+    };
+
+    let data = serde_json::json!({
+        "chain": page_config.chain,
+        "sat": entry.sat,
+        "number": entry.number.to_string(),
+        "timestamp": timestamp(entry.timestamp).to_string(),
+        "genesis_fee": entry.fee,
+        "genesis_height": entry.height,
+        "inscription": serde_json::json!({
+          "content_type":inscription.content_type().unwrap_or("").to_string(),
+          "body":inscription.body().map(|body| str::from_utf8(body).unwrap()).unwrap_or("").to_string(),
+        }),
+        "inscription_url": format!("/content/{}", inscription_id),
+        "inscription_id": inscription_id.to_string(),
+        "location": serde_json::json!({
+          "txid": satpoint.outpoint.txid.to_string(),
+          "vout": satpoint.outpoint.vout,
+          "offset":satpoint.offset,
+          "unbound":if satpoint.outpoint == unbound_outpoint() {true} else {false},
+        }),
+        "genesis_transaction":inscription_id.txid,
+        "output":
+          match output {
+            Some(output) =>  serde_json::json!({
+              "script": output.script_pubkey.to_string(),
+              "value": output.value.to_string(),
+              "address": match page_config.chain.address_from_script(&output.script_pubkey){
+                Ok(address) => address.to_string(),
+                Err(_) => "".to_string(),
+              },
+            }),
+            None =>  serde_json::json!({
+            })
+        }
+    });
+
+    // Serialize the JSON into a string
+    let json = serde_json::to_string(&data).unwrap();
+    Ok(
+      (
+        [
+          (header::CONTENT_TYPE, "application/json"),
+          (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'unsafe-inline'",
+          ),
+        ],
+        json,
+      )
+        .into_response(),
+    )
   }
 
   async fn inscription(
