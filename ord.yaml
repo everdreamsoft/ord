@@ -1,8 +1,9 @@
 # Example Config
 
 # use username `bar` and password `foo` for bitcoind RPC calls
-bitcoin_rpc_user: bar
-bitcoin_rpc_pass: foo
+bitcoin_rpc_user: admin
+bitcoin_rpc_pass: admin
+
 
 # prevent `ord server` from serving the content of the inscriptions below
 hidden:

@@ -125,14 +125,19 @@ pub(crate) struct Server {
 
 impl Server {
   pub(crate) fn run(self, options: Options, index: Arc<Index>, handle: Handle) -> Result {
+
     Runtime::new()?.block_on(async {
-      let clone = index.clone();
-      thread::spawn(move || loop {
-        if let Err(error) = clone.update() {
-          log::warn!("{error}");
-        }
-        thread::sleep(Duration::from_millis(5000));
-      });
+      
+      // TODO Comment this section to index block by block instead of all at once
+      // This section keeps indexed updated 
+      // let clone = index.clone();
+      // thread::spawn(move || loop {
+      //   if let Err(error) = clone.update() {
+      //     log::warn!("{error}");
+      //   }
+      //   thread::sleep(Duration::from_millis(5000));
+      // });
+      ////////////////////////////
 
       let config = options.load_config()?;
       let acme_domains = self.acme_domains()?;
@@ -168,6 +173,7 @@ impl Server {
         .route("/static/*path", get(Self::static_asset))
         .route("/status", get(Self::status))
         .route("/tx/:txid", get(Self::transaction))
+        .route("/api/tx/:txid", get(Self::transaction_json))
         .layer(Extension(index))
         .layer(Extension(page_config))
         .layer(Extension(Arc::new(config)))
@@ -506,6 +512,51 @@ impl Server {
     Ok(
       BlockHtml::new(block, Height(height), Self::index_height(&index)?)
         .page(page_config, index.has_sat_index()?),
+    )
+  }
+
+  async fn transaction_json(
+    Extension(page_config): Extension<Arc<PageConfig>>,
+    Extension(index): Extension<Arc<Index>>,
+    Path(txid): Path<Txid>,
+  ) -> ServerResult<Response> {
+    let inscription = index.get_inscription_by_id(txid.into())?;
+
+    let blockhash = index.get_transaction_blockhash(txid)?;
+
+    let b = match blockhash {
+      Some(blockhash) => blockhash.to_string(),
+      None => "".to_string(),
+    };
+
+    let inscription_id: Option<InscriptionId> = inscription.map(|_| txid.into());
+
+    let insc_id = match inscription_id {
+      Some(inscription_id) =>inscription_id.to_string(),
+      None => "".to_string(),
+    };
+
+    let data = serde_json::json!({
+        "chain": page_config.chain,
+        "block": b,
+        "inscriptionId": insc_id,
+        "content_url": format!("/content/{}", insc_id),
+    });
+
+    // Serialize the JSON into a string
+    let json = serde_json::to_string(&data).unwrap();
+    Ok(
+      (
+        [
+          (header::CONTENT_TYPE, "application/json"),
+          (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'unsafe-inline'",
+          ),
+        ],
+        json,
+      )
+        .into_response(),
     )
   }
 
